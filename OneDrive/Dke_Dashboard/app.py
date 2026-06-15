@@ -3,6 +3,7 @@ import hmac
 import os
 import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -42,62 +43,66 @@ JBOARD_ROLES = ["J-Board"]
 ALL_ROLES = ["Brother"] + EBOARD_ROLES + AUXILIARY_ROLES + JBOARD_ROLES
 
 
-@st.cache_resource
-def get_connection():
-    # Use a small timeout to reduce "database is locked" OperationalError
+@contextmanager
+def get_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
     try:
-        # Enable WAL to reduce write-lock contention
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
     except Exception:
         pass
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db():
-    conn = get_connection()
-    cursor = conn.cursor()
+    with get_db() as conn:
+        cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            role TEXT NOT NULL,
-            position TEXT,
-            access_status TEXT NOT NULL DEFAULT 'active'
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL,
+                position TEXT,
+                access_status TEXT NOT NULL DEFAULT 'active'
+            )
+            """
         )
-        """
-    )
 
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY,
-            title TEXT NOT NULL,
-            description TEXT,
-            assigned_role TEXT,
-            assigned_user_id INTEGER,
-            due_date TEXT,
-            status TEXT NOT NULL DEFAULT 'todo',
-            created_by INTEGER,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (assigned_user_id) REFERENCES users (id)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT,
+                assigned_role TEXT,
+                assigned_user_id INTEGER,
+                due_date TEXT,
+                status TEXT NOT NULL DEFAULT 'todo',
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (assigned_user_id) REFERENCES users (id)
+            )
+            """
         )
-        """
-    )
 
-    cursor.execute("PRAGMA table_info(tasks)")
-    existing_columns = [row[1] for row in cursor.fetchall()]
-    if "due_date" not in existing_columns:
-        cursor.execute("ALTER TABLE tasks ADD COLUMN due_date TEXT")
+        cursor.execute("PRAGMA table_info(tasks)")
+        existing_columns = [row[1] for row in cursor.fetchall()]
+        if "due_date" not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN due_date TEXT")
 
-    conn.commit()
-    seed_defaults(conn)
+        seed_defaults(conn)
 
 
 PBKDF2_ITERATIONS = 180_000
@@ -154,38 +159,38 @@ def format_username(name: str, position: str) -> str:
 
 
 def get_user_by_username(username):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE email = ?", (username.strip().lower(),))
-    return cursor.fetchone()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE email = ?", (username.strip().lower(),))
+        return cursor.fetchone()
 
 
 def get_user_by_id(user_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    return cursor.fetchone()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        return cursor.fetchone()
 
 
 def get_users():
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users ORDER BY role, name")
-    return cursor.fetchall()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users ORDER BY role, name")
+        return cursor.fetchall()
 
 
 def get_tasks():
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT tasks.*, users.name AS assigned_user_name
-        FROM tasks
-        LEFT JOIN users ON users.id = tasks.assigned_user_id
-        ORDER BY tasks.status, tasks.created_at
-        """
-    )
-    return cursor.fetchall()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT tasks.*, users.name AS assigned_user_name
+            FROM tasks
+            LEFT JOIN users ON users.id = tasks.assigned_user_id
+            ORDER BY tasks.status, tasks.created_at
+            """
+        )
+        return cursor.fetchall()
 
 
 def resolve_assigned_user_name(task, users):
@@ -199,47 +204,61 @@ def resolve_assigned_user_name(task, users):
     return None
 
 
+def user_matches_assigned_role(user, assigned_role):
+    aliases = EBOARD_ROLE_ALIASES.get(assigned_role, [assigned_role])
+    return (
+        user["role"] in aliases
+        or (user["position"] and user["position"] in aliases)
+        or (assigned_role == "Brother" and user["role"] == "Brother")
+    )
+
+
+def task_applies_to_user(task, user):
+    if task["assigned_user_id"] is not None:
+        return task["assigned_user_id"] == user["id"] or str(task["assigned_user_id"]) == str(user["id"])
+    if task["assigned_role"]:
+        return user_matches_assigned_role(user, task["assigned_role"])
+    return True
+
+
+def tasks_for_user(tasks, user):
+    if user["role"] == "President":
+        return list(tasks)
+    return [task for task in tasks if task_applies_to_user(task, user)]
+
+
 def add_task(title, assigned_role, assigned_user_id, due_date, created_by):
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
+    with get_db() as conn:
+        cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO tasks (title, assigned_role, assigned_user_id, due_date, status, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (title.strip(), assigned_role, assigned_user_id, due_date, "todo", created_by, datetime.utcnow().isoformat()),
         )
-        conn.commit()
         return cursor.lastrowid
-    except sqlite3.Error:
-        conn.rollback()
-        raise
 
 
 def update_task_status(task_id, status):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
-    conn.commit()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
 
 
 def delete_task(task_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-    conn.commit()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
 
 
 def update_user_access(user_id, access_status):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET access_status = ? WHERE id = ?", (access_status, user_id))
-    conn.commit()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET access_status = ? WHERE id = ?", (access_status, user_id))
 
 
 def update_user_position(user_id, position):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET position = ? WHERE id = ?", (position, user_id))
-    conn.commit()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET position = ? WHERE id = ?", (position, user_id))
 
 
 def user_exists(username):
@@ -249,48 +268,43 @@ def user_exists(username):
 def create_user(name, username, password, role, position, access_status="pending"):
     if user_exists(username):
         return False
-    conn = get_connection()
-    cursor = conn.cursor()
     try:
-        cursor.execute(
-            "INSERT INTO users (name, email, password, role, position, access_status) VALUES (?, ?, ?, ?, ?, ?)",
-            (name.strip(), username.strip().lower(), hash_password(password), role, position, access_status),
-        )
-        conn.commit()
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO users (name, email, password, role, position, access_status) VALUES (?, ?, ?, ?, ?, ?)",
+                (name.strip(), username.strip().lower(), hash_password(password), role, position, access_status),
+            )
         return True
     except sqlite3.IntegrityError:
-        # Likely a UNIQUE constraint on email — treat as existing user
         return False
     except Exception:
-        # Any other DB error — do not crash the app
         return False
 
 
 def president_exists():
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM users WHERE role = ?", ("President",))
-    return cursor.fetchone()[0] > 0
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users WHERE role = ?", ("President",))
+        return cursor.fetchone()[0] > 0
 
 
 def update_user_account(user_id, name, username, role, position, access_status):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE users SET name = ?, email = ?, role = ?, position = ?, access_status = ? WHERE id = ?",
-        (name.strip(), username.strip().lower(), role, position, access_status, user_id),
-    )
-    conn.commit()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET name = ?, email = ?, role = ?, position = ?, access_status = ? WHERE id = ?",
+            (name.strip(), username.strip().lower(), role, position, access_status, user_id),
+        )
 
 
 def reset_user_password(user_id, password):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE users SET password = ? WHERE id = ?",
-        (hash_password(password), user_id),
-    )
-    conn.commit()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET password = ? WHERE id = ?",
+            (hash_password(password), user_id),
+        )
 
 
 def transfer_position(current_user_id, new_user_id):
@@ -301,17 +315,16 @@ def transfer_position(current_user_id, new_user_id):
 
     old_role = current["role"]
     old_position = current["position"]
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE users SET role = ?, position = ? WHERE id = ?",
-        ("Brother", None, current_user_id),
-    )
-    cursor.execute(
-        "UPDATE users SET role = ?, position = ? WHERE id = ?",
-        (old_role, old_position, new_user_id),
-    )
-    conn.commit()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET role = ?, position = ? WHERE id = ?",
+            ("Brother", None, current_user_id),
+        )
+        cursor.execute(
+            "UPDATE users SET role = ?, position = ? WHERE id = ?",
+            (old_role, old_position, new_user_id),
+        )
     return True
 
 
@@ -668,17 +681,41 @@ def home_page():
         "### Welcome to the DKE chapter dashboard.\n"
         "Friends From the Heart Forever."
     )
+    user = st.session_state["current_user"]
     tasks = get_tasks()
-    open_tasks = [task for task in tasks if task["status"] != "done"]
-    st.metric("Open tasks", len(open_tasks))
-    if st.session_state["current_user"]["role"] == "President":
+    visible_tasks = tasks_for_user(tasks, user)
+    open_tasks = [task for task in visible_tasks if task["status"] != "done"]
+    st.metric("Your open tasks", len(open_tasks))
+
+    if open_tasks:
+        st.subheader("Your current assignments")
+        users = get_users()
+        for task in open_tasks:
+            assigned_user_name = resolve_assigned_user_name(task, users)
+            assignment = (
+                f"Assigned to {assigned_user_name}"
+                if assigned_user_name
+                else (f"Assigned to {task['assigned_role']}" if task["assigned_role"] else "Chapter-wide")
+            )
+            due = f" — due {task['due_date']}" if task["due_date"] else ""
+            status_label = task["status"].replace("_", " ").title()
+            st.write(f"- **{task['title']}** ({status_label}) — {assignment}{due}")
+    elif tasks:
+        st.info("No open tasks assigned to you right now. Check the Task Board for chapter updates.")
+    else:
+        st.info("No tasks have been created yet.")
+
+    if user["role"] == "President":
         st.success("You have President access to manage members and tasks.")
 
 
 def task_list_page():
     st.header("Task Board")
-    st.markdown("View all assigned tasks and manage their status.")
     user = st.session_state["current_user"]
+    if user["role"] == "President":
+        st.markdown("View and manage all chapter tasks.")
+    else:
+        st.markdown("View tasks assigned to you, your position, or the whole chapter.")
 
     if "show_create_task_form" not in st.session_state:
         st.session_state["show_create_task_form"] = False
@@ -690,8 +727,8 @@ def task_list_page():
             if st.button("➕ Create Task"):
                 st.session_state["show_create_task_form"] = True
 
-    # Create Task Form
-    if st.session_state["show_create_task_form"]:
+    # Create Task Form (President only)
+    if user["role"] == "President" and st.session_state["show_create_task_form"]:
         with st.form("create_task_form"):
             title = st.text_input("Task title")
             position_options = ["Any"] + EBOARD_ROLES + AUXILIARY_ROLES + JBOARD_ROLES + ["Brother"]
@@ -722,42 +759,50 @@ def task_list_page():
             submit = col1.form_submit_button("Create task")
             cancel = col2.form_submit_button("Cancel")
             if submit:
+                valid = True
                 if not title:
                     st.error("Task title is required.")
+                    valid = False
                 elif due_date:
                     try:
                         datetime.strptime(due_date, "%m-%d-%Y")
                     except ValueError:
                         st.error("Due date must be in MM-DD-YYYY format.")
-                        return
-                try:
-                    task_id = add_task(
-                        title,
-                        assigned_role if assigned_role != "Any" else None,
-                        assigned_user_id,
-                        due_date,
-                        user["id"],
-                    )
-                except sqlite3.Error as exc:
-                    st.error(f"Could not save task to the database: {exc}")
-                    return
-                st.success(f"Task added. ID: {task_id}")
-                st.session_state["show_create_task_form"] = False
-                st.rerun()
+                        valid = False
+                if valid:
+                    try:
+                        task_id = add_task(
+                            title,
+                            assigned_role if assigned_role != "Any" else None,
+                            assigned_user_id,
+                            due_date,
+                            user["id"],
+                        )
+                    except sqlite3.Error as exc:
+                        st.error(f"Could not save task to the database: {exc}")
+                    else:
+                        st.success(f"Task added. ID: {task_id}")
+                        st.session_state["show_create_task_form"] = False
+                        st.rerun()
             if cancel:
                 st.session_state["show_create_task_form"] = False
                 st.rerun()
 
     # Get Tasks
     tasks = get_tasks()
-    if not tasks:
-        st.info("No tasks available yet.")
+    visible_tasks = tasks_for_user(tasks, user)
+    if not visible_tasks:
+        if tasks and user["role"] != "President":
+            st.info("No tasks are assigned to you yet. Chapter-wide tasks will appear here when the President creates them.")
+        else:
+            st.info("No tasks available yet.")
         return
 
     users = get_users()
-    
+
     # Display Assigned Tasks Section
-    st.subheader("📋 All Assigned Tasks")
+    section_title = "All Chapter Tasks" if user["role"] == "President" else "Your Assigned Tasks"
+    st.subheader(f"📋 {section_title}")
     
     # Filter into status groups
     status_columns = {
@@ -770,7 +815,7 @@ def task_list_page():
     cols = st.columns([1, 1, 1])
     
     for idx, status in enumerate(["todo", "in_progress", "done"]):
-        status_tasks = [t for t in tasks if t["status"] == status]
+        status_tasks = [t for t in visible_tasks if t["status"] == status]
         with cols[idx]:
             st.markdown(f"**{status_columns[status]}** ({len(status_tasks)})")
             st.divider()
