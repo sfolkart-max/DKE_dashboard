@@ -1,2 +1,7 @@
+<<<<<<< HEAD
 streamlit
 libsql-experimental
+=======
+streamlit==1.58.0
+libsql
+>>>>>>> 0327f74 (Changes)
