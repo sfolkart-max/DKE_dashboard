@@ -17,6 +17,33 @@ st.set_page_config(
 
 DB_PATH = Path(__file__).parent / "dke.db"
 
+USERS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        role TEXT NOT NULL,
+        position TEXT,
+        access_status TEXT NOT NULL DEFAULT 'active'
+    )
+"""
+
+TASKS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT,
+        assigned_role TEXT,
+        assigned_user_id INTEGER,
+        due_date TEXT,
+        status TEXT NOT NULL DEFAULT 'todo',
+        created_by INTEGER,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (assigned_user_id) REFERENCES users (id)
+    )
+"""
+
 EBOARD_ROLES = [
     "President",
     "Vice President",
@@ -43,15 +70,133 @@ JBOARD_ROLES = ["J-Board"]
 ALL_ROLES = ["Brother"] + EBOARD_ROLES + AUXILIARY_ROLES + JBOARD_ROLES
 
 
-@contextmanager
-def get_db():
+def _turso_config():
+    try:
+        cfg = st.secrets.get("turso", {})
+        url = (cfg.get("database_url") or "").strip()
+        token = (cfg.get("auth_token") or "").strip()
+        if url and token:
+            return url, token
+    except Exception:
+        pass
+    return None, None
+
+
+def _use_shared_db():
+    return _turso_config()[0] is not None
+
+
+def _likely_streamlit_cloud():
+    return os.environ.get("STREAMLIT_RUNTIME_ENVIRONMENT") == "cloud"
+
+
+def _open_connection():
+    turso_url, turso_token = _turso_config()
+    if turso_url and turso_token:
+        import libsql_experimental as libsql
+
+        return libsql.connect(turso_url, auth_token=turso_token)
+
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _prepare_connection(conn):
+    if not isinstance(conn, sqlite3.Connection):
+        return conn
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
     except Exception:
         pass
+    return conn
+
+
+def _row_to_mapping(row, cursor=None):
+    if row is None:
+        return None
+    if isinstance(row, sqlite3.Row):
+        return row
+    if hasattr(row, "keys"):
+        return row
+    if cursor is not None and cursor.description:
+        columns = [col[0] for col in cursor.description]
+        return {columns[i]: row[i] for i in range(len(columns))}
+    return row
+
+
+def _fetchone(cursor):
+    return _row_to_mapping(cursor.fetchone(), cursor)
+
+
+def _fetchall(cursor):
+    rows = cursor.fetchall()
+    if not rows:
+        return []
+    if isinstance(rows[0], sqlite3.Row) or hasattr(rows[0], "keys"):
+        return rows
+    columns = [col[0] for col in cursor.description]
+    return [{columns[i]: row[i] for i in range(len(columns))} for row in rows]
+
+
+def migrate_local_sqlite_to_shared_if_needed(conn):
+    if not _use_shared_db() or not DB_PATH.exists():
+        return
+
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users")
+    if cursor.fetchone()[0] > 0:
+        return
+
+    local = sqlite3.connect(DB_PATH)
+    local.row_factory = sqlite3.Row
+    try:
+        local_users = local.execute("SELECT * FROM users").fetchall()
+        local_tasks = local.execute("SELECT * FROM tasks").fetchall()
+    finally:
+        local.close()
+
+    for user in local_users:
+        cursor.execute(
+            "INSERT OR IGNORE INTO users (id, name, email, password, role, position, access_status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                user["id"],
+                user["name"],
+                user["email"],
+                user["password"],
+                user["role"],
+                user["position"],
+                user["access_status"],
+            ),
+        )
+
+    for task in local_tasks:
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO tasks (
+                id, title, description, assigned_role, assigned_user_id,
+                due_date, status, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task["id"],
+                task["title"],
+                task["description"],
+                task["assigned_role"],
+                task["assigned_user_id"],
+                task["due_date"],
+                task["status"],
+                task["created_by"],
+                task["created_at"],
+            ),
+        )
+
+
+@contextmanager
+def get_db():
+    conn = _prepare_connection(_open_connection())
     try:
         yield conn
         conn.commit()
@@ -65,43 +210,15 @@ def get_db():
 def init_db():
     with get_db() as conn:
         cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                role TEXT NOT NULL,
-                position TEXT,
-                access_status TEXT NOT NULL DEFAULT 'active'
-            )
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY,
-                title TEXT NOT NULL,
-                description TEXT,
-                assigned_role TEXT,
-                assigned_user_id INTEGER,
-                due_date TEXT,
-                status TEXT NOT NULL DEFAULT 'todo',
-                created_by INTEGER,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (assigned_user_id) REFERENCES users (id)
-            )
-            """
-        )
+        cursor.execute(USERS_TABLE_SQL)
+        cursor.execute(TASKS_TABLE_SQL)
 
         cursor.execute("PRAGMA table_info(tasks)")
         existing_columns = [row[1] for row in cursor.fetchall()]
         if "due_date" not in existing_columns:
             cursor.execute("ALTER TABLE tasks ADD COLUMN due_date TEXT")
 
+        migrate_local_sqlite_to_shared_if_needed(conn)
         seed_defaults(conn)
 
 
@@ -162,21 +279,21 @@ def get_user_by_username(username):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users WHERE email = ?", (username.strip().lower(),))
-        return cursor.fetchone()
+        return _fetchone(cursor)
 
 
 def get_user_by_id(user_id):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-        return cursor.fetchone()
+        return _fetchone(cursor)
 
 
 def get_users():
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users ORDER BY role, name")
-        return cursor.fetchall()
+        return _fetchall(cursor)
 
 
 def get_tasks():
@@ -190,7 +307,7 @@ def get_tasks():
             ORDER BY tasks.status, tasks.created_at
             """
         )
-        return cursor.fetchall()
+        return _fetchall(cursor)
 
 
 def resolve_assigned_user_name(task, users):
@@ -683,14 +800,17 @@ def home_page():
     )
     user = st.session_state["current_user"]
     tasks = get_tasks()
-    visible_tasks = tasks_for_user(tasks, user)
-    open_tasks = [task for task in visible_tasks if task["status"] != "done"]
-    st.metric("Your open tasks", len(open_tasks))
+    my_tasks = tasks_for_user(tasks, user)
+    open_tasks = [task for task in tasks if task["status"] != "done"]
+    my_open_tasks = [task for task in my_tasks if task["status"] != "done"]
+    st.metric("Chapter open tasks", len(open_tasks))
+    if user["role"] != "President":
+        st.caption(f"{len(my_open_tasks)} assigned to you")
 
-    if open_tasks:
+    if my_open_tasks:
         st.subheader("Your current assignments")
         users = get_users()
-        for task in open_tasks:
+        for task in my_open_tasks:
             assigned_user_name = resolve_assigned_user_name(task, users)
             assignment = (
                 f"Assigned to {assigned_user_name}"
@@ -701,7 +821,7 @@ def home_page():
             status_label = task["status"].replace("_", " ").title()
             st.write(f"- **{task['title']}** ({status_label}) — {assignment}{due}")
     elif tasks:
-        st.info("No open tasks assigned to you right now. Check the Task Board for chapter updates.")
+        st.info("No open tasks are assigned to you right now. Check the Task Board for all chapter tasks.")
     else:
         st.info("No tasks have been created yet.")
 
@@ -712,10 +832,13 @@ def home_page():
 def task_list_page():
     st.header("Task Board")
     user = st.session_state["current_user"]
-    if user["role"] == "President":
-        st.markdown("View and manage all chapter tasks.")
-    else:
-        st.markdown("View tasks assigned to you, your position, or the whole chapter.")
+    st.markdown("View all chapter tasks and update their status.")
+
+    if not _use_shared_db() and _likely_streamlit_cloud():
+        st.warning(
+            "Tasks are not shared across devices until Turso is configured. "
+            "Add `[turso]` secrets in Streamlit Cloud (see `.streamlit/secrets.toml.example`)."
+        )
 
     if "show_create_task_form" not in st.session_state:
         st.session_state["show_create_task_form"] = False
@@ -778,7 +901,7 @@ def task_list_page():
                             due_date,
                             user["id"],
                         )
-                    except sqlite3.Error as exc:
+                    except Exception as exc:
                         st.error(f"Could not save task to the database: {exc}")
                     else:
                         st.success(f"Task added. ID: {task_id}")
@@ -788,21 +911,15 @@ def task_list_page():
                 st.session_state["show_create_task_form"] = False
                 st.rerun()
 
-    # Get Tasks
+    # Get Tasks — all chapter tasks are visible to every signed-in member.
     tasks = get_tasks()
-    visible_tasks = tasks_for_user(tasks, user)
-    if not visible_tasks:
-        if tasks and user["role"] != "President":
-            st.info("No tasks are assigned to you yet. Chapter-wide tasks will appear here when the President creates them.")
-        else:
-            st.info("No tasks available yet.")
+    if not tasks:
+        st.info("No tasks available yet.")
         return
 
     users = get_users()
 
-    # Display Assigned Tasks Section
-    section_title = "All Chapter Tasks" if user["role"] == "President" else "Your Assigned Tasks"
-    st.subheader(f"📋 {section_title}")
+    st.subheader("📋 Chapter Task Board")
     
     # Filter into status groups
     status_columns = {
@@ -815,7 +932,7 @@ def task_list_page():
     cols = st.columns([1, 1, 1])
     
     for idx, status in enumerate(["todo", "in_progress", "done"]):
-        status_tasks = [t for t in visible_tasks if t["status"] == status]
+        status_tasks = [t for t in tasks if t["status"] == status]
         with cols[idx]:
             st.markdown(f"**{status_columns[status]}** ({len(status_tasks)})")
             st.divider()
