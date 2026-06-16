@@ -7,6 +7,15 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+import libsql
+
+def get_connection():
+    # Use Streamlit secrets to securely store your Turso URL and Auth Token
+    url = st.secrets["TURSO_DATABASE_URL"]
+    auth_token = st.secrets["TURSO_AUTH_TOKEN"]
+    
+    return libsql.connect(database="libsql://dke-sfolkart-max.aws-us-east-2.turso.io", auth_token=auth_token)
+
 import streamlit as st
 
 st.set_page_config(
