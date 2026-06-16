@@ -11,10 +11,10 @@ import libsql
 
 def get_connection():
     # Use Streamlit secrets to securely store your Turso URL and Auth Token
-    url = st.secrets["TURSO_DATABASE_URL"]
-    auth_token = st.secrets["TURSO_AUTH_TOKEN"]
+    url = st.secrets["libsql://dke-sfolkart-max.aws-us-east-2.turso.io"]
+    auth_token = st.secrets["eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODE2NTAzOTMsImlkIjoiMDE5ZWQyYTEtYTIwMS03NDI2LTgyM2MtN2EyYjJiN2VkYmU3IiwicmlkIjoiMGI4MjU0MzQtZjY4My00Y2NhLTk4NWEtMmZkMDMyZDYxYjE1In0.c68pUmDwFJPbRYRnugezTtTx6fkWhEFzsKzr-wIsy06EfGuPsKm1WsY5GGrrM6kqxnRunlI0-G_fjrBS2xojCg"]
     
-    return libsql.connect(database="libsql://dke-sfolkart-max.aws-us-east-2.turso.io", auth_token=auth_token)
+    return libsql.connect(database="libsql://dke-sfolkart-max.aws-us-east-2.turso.io", auth_token="eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODE2NTAzOTMsImlkIjoiMDE5ZWQyYTEtYTIwMS03NDI2LTgyM2MtN2EyYjJiN2VkYmU3IiwicmlkIjoiMGI4MjU0MzQtZjY4My00Y2NhLTk4NWEtMmZkMDMyZDYxYjE1In0.c68pUmDwFJPbRYRnugezTtTx6fkWhEFzsKzr-wIsy06EfGuPsKm1WsY5GGrrM6kqxnRunlI0-G_fjrBS2xojCg")
 
 import streamlit as st
 
