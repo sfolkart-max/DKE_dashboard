@@ -502,6 +502,10 @@ def inject_theme_styles():
         }
         .pill-blue { background: #4d7bd1; }
         .pill-gold { background: #f0b429; }
+        .pill-crimson {
+            background: #8b0000;
+            color: #ffffff;
+        }
         .task-badge {
             display: inline-block;
             background: rgba(201,151,0,0.8);
@@ -724,7 +728,7 @@ def task_list_page():
     if user["role"] == "President":
         st.markdown("View and manage all chapter tasks.")
     else:
-        st.markdown("View tasks assigned to you, your position, or the whole chapter.")
+        st.markdown("View all chapter tasks.")
 
     if "show_create_task_form" not in st.session_state:
         st.session_state["show_create_task_form"] = False
@@ -799,18 +803,15 @@ def task_list_page():
 
     # Get Tasks
     tasks = get_tasks()
-    visible_tasks = tasks_for_user(tasks, user)
+    visible_tasks = tasks
     if not visible_tasks:
-        if tasks and user["role"] != "President":
-            st.info("No tasks are assigned to you yet. Chapter-wide tasks will appear here when the President creates them.")
-        else:
-            st.info("No tasks available yet.")
+        st.info("No tasks available yet.")
         return
 
     users = get_users()
 
     # Display Assigned Tasks Section
-    section_title = "All Chapter Tasks" if user["role"] == "President" else "Your Assigned Tasks"
+    section_title = "All Chapter Tasks"
     st.subheader(f"📋 {section_title}")
     
     # Filter into status groups
